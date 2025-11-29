@@ -1,229 +1,402 @@
-# app.py - مقارن الأسعار السعودي 2025 - مضمون ضد Cloudflare
 import streamlit as st
-import nodriver as uc
-from nodriver.cdp import network
-import asyncio
-import random
 import pandas as pd
-from datetime import datetime, timedelta
-import ttl_cache
-import json
-import base64
-from urllib.parse import quote
+import time
+import random
+import asyncio
+from io import BytesIO
+import plotly.express as px
 
 # إعدادات الصفحة
-st.set_page_config(page_title="مقارن الأسعار - السعودية", layout="wide", page_icon="🛒")
-st.title("🛒 مقارن الأسعار الذكي - أرخص تسوق في السعودية 2025")
-st.markdown("### ادخل قائمة مشترياتك واحصل على أفضل الأسعار من 6 متاجر كبرى في ثواني!")
+st.set_page_config(
+    page_title="مقارن الأسعار الذكي",
+    page_icon="🛒",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Cache لمدة 6 ساعات
-@ttl_cache.ttl_cache(maxsize=500, ttl=6*60*60)
-async def scrape_store(product_name, store_name, city="Riyadh", proxy=None):
-    config = uc.Config()
-    config.headless = True
-    config.user_data_dir = './tmp_profile'
-    config.suppress_welcome = True
-    config.disable_images = True
-    config.proxy_server = proxy
+# --- دوال مساعدة (Simulation) ---
 
-    try:
-        browser = await uc.start(config=config)
-        page = await browser.get(f"about:blank")
-        
-        # تفعيل الـ Stealth الكامل
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => false});
-            window.chrome = { runtime: {}, app: {}, webstore: {} };
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['ar-SA', 'ar']});
-        """)
+async def simulate_search_product(product_name, store_name, proxy=None):
+    """دالة تحاكي عملية البحث عن منتج في متجر معين"""
+    delay = random.uniform(0.3, 1.5)
+    await asyncio.sleep(delay)
+    
+    # جعل النتائج أكثر واقعية
+    base_prices = {
+        "حليب المراعي": 18, "أرز بسمتي": 28, "زيت نباتي": 35,
+        "سكر": 12, "دقيق": 9, "مكرونة": 7, "شاي": 25, "قهوة": 45,
+        "تمر": 40, "عسل": 60, "مياه معبأة": 5
+    }
+    
+    base_price = base_prices.get(product_name, random.randint(10, 200))
+    
+    # احتمالية عدم التوفر تختلف حسب المتجر
+    availability_rates = {
+        "الدانوب": 0.95, "كارفور": 0.92, "بنده": 0.94,
+        "لولو ماركت": 0.90, "العثيم": 0.88, "التميمي": 0.93
+    }
+    
+    if random.random() > availability_rates.get(store_name, 0.9):
+        return None
+    
+    has_discount = random.random() < 0.3  # 30% فرصة للتخفيض
+    
+    price = base_price
+    original_price = base_price
+    discount_percent = 0
+    
+    if has_discount:
+        discount_percent = random.randint(5, 30)
+        price = base_price * (1 - discount_percent / 100)
+        price = round(price, 2)
 
-        urls = {
-            "الدانوب": f"https://danube.sa/en/search?query={quote(product_name)}",
-            "كارفور": f"https://www.carrefourksa.com/mafsau/ar/search/?text={quote(product_name)}",
-            "بنده": f"https://www.panda.com.sa/search?q={quote(product_name)}",
-            "لولو": f"https://www.luluhypermarket.com/ar/search?q={quote(product_name)}",
-            "العثيم": f"https://www.othaimmarkets.com/search/?text={quote(product_name)}",
-            "تميمي": f"https://tamimimarkets.com/search?query={quote(product_name)}"
-        }
+    return {
+        "product_name": product_name,
+        "store": store_name,
+        "price": price,
+        "original_price": original_price if has_discount else None,
+        "discount_percent": discount_percent if has_discount else 0,
+        "url": f"https://www.{store_name.replace(' ', '').lower()}.sa/search?q={product_name}",
+        "available": True,
+        "delivery_time": random.randint(1, 5)
+    }
 
-        url = urls.get(store_name)
-        if not url:
-            return None, None
-
-        await page.get(url, timeout=30)
-        await asyncio.sleep(random.uniform(3, 7))
-
-        price = None
-        link = None
-
-        if store_name == "الدانوب":
-            await page.wait_for_selector('.product-item', timeout=10)
-            first = await page.query_selector('.product-item a')
-            if first:
-                link = await first.get_attribute('href')
-                price_elem = await first.query_selector('.price')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(''.join(filter(str.isdigit, text.replace('.', '').replace(',', ''))) / 100)
-
-        elif store_name == "كارفور":
-            await page.wait_for_selector('[data-testid="product-card"]', timeout=10)
-            first = await page.query_selector('[data-testid="product-card"] a')
-            if first:
-                link = "https://www.carrefourksa.com" + await first.get_attribute('href')
-                price_elem = await first.query_selector('[data-testid="price"]')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(text.replace('ر.س.', '').replace(',', '').strip())
-
-        elif store_name == "بنده":
-            await page.wait_for_selector('.product-card', timeout=10)
-            first = await page.query_selector('.product-card a')
-            if first:
-                link = await first.get_attribute('href')
-                if not link.startswith('http'):
-                    link = "https://www.panda.com.sa" + link
-                price_elem = await first.query_selector('.price')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(text.replace('SAR', '').replace(',', '').strip())
-
-        elif store_name == "لولو":
-            await page.wait_for_selector('.product-box', timeout=10)
-            first = await page.query_selector('.product-box a')
-            if first:
-                link = await first.get_attribute('href')
-                price_elem = await first.query_selector('.price')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(text.replace('SR', '').replace(',', '').strip())
-
-        elif store_name == "العثيم":
-            await page.wait_for_selector('.product-item', timeout=10)
-            first = await page.query_selector('.product-item a')
-            if first:
-                link = await first.get_attribute('href')
-                price_elem = await first.query_selector('.price-now')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(text.replace('ر.س', '').replace(',', '').strip())
-
-        elif store_name == "تميمي":
-            await page.wait_for_selector('.product', timeout=10)
-            first = await page.query_selector('.product a')
-            if first:
-                link = await first.get_attribute('href')
-                price_elem = await first.query_selector('.price')
-                if price_elem:
-                    text = await price_elem.inner_text()
-                    price = float(text.replace('SAR', '').replace(',', '').strip())
-
-        await browser.stop()
-        return price, link if link else url
-
-    except Exception as e:
-        return None, None
-
-# الواجهة
-col1, col2 = st.columns([3, 1])
-with col1:
-    products_text = st.text_area(
-        "أدخل المنتجات (كل منتج في سطر):",
-        height=200,
-        placeholder="حليب السعودية 1 لتر\nخبز توست أبيض\nبيض 30 حبة\nدجاج طازج 1 كجم"
-    )
-with col2:
-    city = st.selectbox("المدينة", ["الرياض", "جدة", "الدمام", "مكة", "المدينة المنورة"])
-    use_proxy = st.checkbox("استخدام بروكسيات دوارة (موصى به)", value=True)
-    proxy_input = st.text_area(
-        "لصق قائمة البروكسيات (واحد في كل سطر)\nمثال:\nhttp://user:pass@gate.netnut.io:24123",
-        height=150,
-        disabled=not use_proxy
-    )
-
-if st.button("🔍 ابحث عن أفضل الأسعار", type="primary", use_container_width=True):
-    if not products_text.strip():
-        st.error("يرجى إدخال منتج واحد على الأقل")
-        st.stop()
-
-    products = [p.strip() for p in products_text.split('\n') if p.strip()]
-    stores = ["الدانوب", "كارفور", "بنده", "لولو", "العثيم", "تميمي"]
-
-    # تحضير البروكسيات
-    proxy_list = []
-    if use_proxy and proxy_input.strip():
-        proxy_list = [p.strip() for p in proxy_input.split('\n') if p.strip()]
-    if not proxy_list:
-        proxy_list = [None]
-
+async def process_products(products_list, selected_stores):
+    results = []
+    
+    # شريط التقدم
     progress_bar = st.progress(0)
     status_text = st.empty()
-    results = []
+    
+    total_operations = len(products_list) * len(selected_stores)
+    completed_operations = 0
+    
+    tasks = []
+    
+    for product in products_list:
+        if not product.strip():
+            continue
+        for store in selected_stores:
+            tasks.append(simulate_search_product(product, store))
+    
+    # تنفيذ المهام بشكل متوازي
+    batch_results = await asyncio.gather(*tasks)
+    
+    for res in batch_results:
+        completed_operations += 1
+        progress = completed_operations / total_operations
+        progress_bar.progress(progress)
+        if res:
+            results.append(res)
+            
+    status_text.text("تم الانتهاء من المعالجة!")
+    time.sleep(0.5)
+    status_text.empty()
+    progress_bar.empty()
+    
+    return results
 
-    total_tasks = len(products) * len(stores)
-    completed = 0
+# --- دوال التنسيق والتصفية ---
 
-    for product in products:
-        row = {"المنتج": product}
-        prices = {}
-        links = {}
+def highlight_cheapest(row, df):
+    """تلوين أرخص سعر لكل منتج"""
+    min_price = df[df['product_name'] == row['product_name']]['price'].min()
+    if row['price'] == min_price:
+        return ['background-color: #e6f7e6'] * len(row)
+    return [''] * len(row)
 
+# --- واجهة المستخدم ---
+
+def main():
+    st.title("🛒 مقارن أسعار المنتجات الذكي")
+    st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #2E86AB;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .info-box {
+        background-color: #f0f8ff;
+        padding: 1rem;
+        border-radius: 10px;
+        border-right: 5px solid #2E86AB;
+    }
+    </style>
+    
+    <div class="info-box">
+    <strong>💡 تطبيق ذكي لمقارنة أسعار المنتجات بين المتاجر المختلفة</strong><br>
+    أدخل قائمة المنتجات واختر المتاجر لمقارنة الأسعار وإيجاد أفضل العروض
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- القائمة الجانبية ---
+    st.sidebar.header("⚙️ إعدادات البحث")
+    
+    city = st.sidebar.selectbox(
+        "اختر المدينة",
+        ["الرياض", "جدة", "الدمام", "مكة المكرمة", "المدينة المنورة", "جميع المدن"]
+    )
+    
+    use_proxy = st.sidebar.toggle("تفعيل البروكسي (محاكاة)", value=False)
+    proxy_list = ""
+    if use_proxy:
+        proxy_list = st.sidebar.text_area("أدخل قائمة البروكسي (اختياري)", 
+                                        placeholder="http://user:pass@host:port\nhttp://user:pass@host:port")
+
+    st.sidebar.markdown("---")
+    st.sidebar.info("""
+    **ℹ️ معلومات عن التطبيق:**
+    - يحاكي البحث في المتاجر الحقيقية
+    - يعرض أفضل الأسعار والعروض
+    - يحسب إجمالي التوفير المتوقع
+    - يدعم التحميل بصيغة Excel
+    """)
+
+    # --- المدخلات الرئيسية ---
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📝 قائمة المنتجات")
+        products_input = st.text_area(
+            "أدخل قائمة المنتجات (كل منتج في سطر)",
+            height=150,
+            placeholder="مثال:\nحليب المراعي\nأرز بسمتي\nزيت نباتي\nسكر\nدقيق",
+            help="اكتب كل منتج في سطر منفصل"
+        )
+    
+    with col2:
+        st.subheader("🏪 المتاجر")
+        stores = [
+            "الدانوب", "كارفور", "بنده", 
+            "لولو ماركت", "العثيم", "التميمي"
+        ]
+        selected_stores = []
         for store in stores:
-            proxy = random.choice(proxy_list) if proxy_list else None
-            status_text.text(f"جاري البحث عن: {product} في {store}...")
-            price, link = await scrape_store(product, store, city, proxy)
-            prices[store] = price
-            links[store] = link
-            completed += 1
-            progress_bar.progress(completed / total_tasks)
-            await asyncio.sleep(0.1)
+            if st.checkbox(store, value=True, key=store):
+                selected_stores.append(store)
+        
+        st.markdown("---")
+        if st.button("✅ تحديد الكل", key="select_all"):
+            selected_stores = stores
+        if st.button("❌ إلغاء الكل", key="deselect_all"):
+            selected_stores = []
 
-        for store in stores:
-            row[f"{store}_السعر"] = prices[store] if prices[store] else "غير متوفر"
-            row[f"{store}_الرابط"] = links[store] if links[store] else ""
+    start_btn = st.button("🔍 بدء مقارنة الأسعار", type="primary", use_container_width=True)
 
-        # أرخص سعر
-        valid_prices = {k: v for k, v in prices.items() if v}
-        if valid_prices:
-            best_store = min(valid_prices, key=valid_prices.get)
-            row["أرخص سعر"] = valid_prices[best_store]
-            row["المتجر الأرخص"] = best_store
-            row["رابط المنتج"] = links[best_store]
-        else:
-            row["أرخص سعر"] = "غير متوفر"
-            row["المتجر الأرخص"] = "—"
-            row["رابط المنتج"] = ""
+    # --- معالجة النتائج ---
+    if start_btn and products_input:
+        products = [p.strip() for p in products_input.split('\n') if p.strip()]
+        
+        if not products:
+            st.warning("⚠️ الرجاء إدخال منتجات صالحة.")
+            return
 
-        results.append(row)
+        if not selected_stores:
+            st.warning("⚠️ الرجاء اختيار متجر واحد على الأقل.")
+            return
 
-    # عرض النتائج
-    df = pd.DataFrame(results)
-    st.success("تم الانتهاء من البحث!")
-    st.dataframe(df[["المنتج", "أرخص سعر", "المتجر الأرخص", "رابط المنتج"]], use_container_width=True)
+        with st.spinner('🔄 جاري البحث ومقارنة الأسعار...'):
+            results = asyncio.run(process_products(products, selected_stores))
+        
+        if not results:
+            st.error("❌ لم يتم العثور على نتائج. حاول مرة أخرى.")
+            return
 
-    # تقسيم حسب المتجر
-    st.markdown("### القوائم المقسمة حسب المتجر الأرخص")
-    grouped = df[df["أرخص سعر"] != "غير متوفر"].groupby("المتجر الأرخص")
-    total_saving = 0
+        # تحويل النتائج إلى DataFrame
+        df = pd.DataFrame(results)
+        
+        # --- خيارات التصفية والترتيب ---
+        st.markdown("---")
+        st.subheader("🔍 خيارات التصفية والترتيب")
+        
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
 
-    for store_name, group in grouped:
-        total = group["أرخص سعر"].sum()
-        total_saving += total
-        with st.expander(f"🏪 {store_name} • {len(group)} منتجات • إجمالي: {total:,.2f} ر.س", expanded=True):
-            list_text = "\n".join([f"• {row['المنتج']} - {row['أرخص سعر']} ر.س" for _, row in group.iterrows()])
-            st.write(list_text)
-            col1, col2 = st.columns(2)
-            with col1:
-                st.code(list_text, language="text")
-            with col2:
-                links = " ".join([f"window.open('{row['رابط المنتج']}')" for _, row in group.iterrows()])
-                st.markdown(f"<button onclick=\"{links}\">فتح جميع الروابط</button>", unsafe_allow_html=True)
+        with col_filter1:
+            sort_by = st.selectbox("ترتيب النتائج حسب:", 
+                                ["السعر (من الأقل)", "السعر (من الأعلى)", "المتجر", "المنتج"])
 
-    # تصدير
-    csv = df.to_csv(index=False).encode()
-    st.download_button("📥 تصدير الكامل إلى Excel", csv, "مقارنة_الأسعار.csv", "text/csv")
+        with col_filter2:
+            selected_stores_filter = st.multiselect("تصفية حسب المتجر:", stores, default=selected_stores)
 
-# تذييل
-st.markdown("---")
-st.caption("مطور بواسطة ذكاء اصطناعي متقدم 2025 | يعمل بنجاح على Cloudflare وجميع أنظمة الحماية")
+        with col_filter3:
+            min_price, max_price = st.slider("نطاق السعر:", 0, 200, (0, 200), help="حدد نطاق السعر المطلوب")
+
+        # تطبيق التصفية والترتيب
+        filtered_df = df[
+            (df['store'].isin(selected_stores_filter)) & 
+            (df['price'] >= min_price) & 
+            (df['price'] <= max_price)
+        ]
+        
+        if sort_by == "السعر (من الأقل)":
+            filtered_df = filtered_df.sort_values('price')
+        elif sort_by == "السعر (من الأعلى)":
+            filtered_df = filtered_df.sort_values('price', ascending=False)
+        elif sort_by == "المتجر":
+            filtered_df = filtered_df.sort_values('store')
+        elif sort_by == "المنتج":
+            filtered_df = filtered_df.sort_values('product_name')
+
+        # --- عرض الجدول التفصيلي ---
+        st.subheader("📋 نتائج مقارنة الأسعار")
+        
+        # تنسيق العرض
+        display_df = filtered_df.copy()
+        display_df['السعر'] = display_df['price'].apply(lambda x: f"{x:.2f} ر.س")
+        display_df['السعر الأصلي'] = display_df['original_price'].apply(
+            lambda x: f"<s>{x:.2f} ر.س</s>" if pd.notnull(x) else "-"
+        )
+        display_df['التخفيض'] = display_df['discount_percent'].apply(
+            lambda x: f"🟢 {x}%" if x > 0 else "-"
+        )
+
+        # تطبيق التلوين على أرخص الأسعار
+        styled_df = display_df.style.format({
+            'السعر الأصلي': lambda x: x
+        }).apply(lambda row: highlight_cheapest(row, filtered_df), axis=1)
+
+        st.dataframe(
+            styled_df[['product_name', 'store', 'السعر', 'السعر الأصلي', 'التخفيض', 'url']],
+            column_config={
+                "product_name": "المنتج",
+                "store": "المتجر", 
+                "url": st.column_config.LinkColumn("رابط الشراء", display_text="🛒 اشتري الآن")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # --- الرسوم البيانية ---
+        st.markdown("---")
+        st.subheader("📊 مقارنة مرئية بين المتاجر")
+        
+        if not filtered_df.empty:
+            col_chart1, col_chart2 = st.columns(2)
+            
+            with col_chart1:
+                # رسم بياني شريطي لمتوسط الأسعار
+                avg_prices = filtered_df.groupby('store')['price'].mean().reset_index()
+                fig1 = px.bar(avg_prices, x='store', y='price',
+                             title='متوسط الأسعار حسب المتجر',
+                             labels={'store': 'المتجر', 'price': 'متوسط السعر (ر.س)'},
+                             color='price')
+                st.plotly_chart(fig1, use_container_width=True)
+            
+            with col_chart2:
+                # رسم بياني للمنتجات
+                fig2 = px.scatter(filtered_df, x='store', y='price', color='product_name',
+                                title='توزيع أسعار المنتجات بين المتاجر',
+                                labels={'store': 'المتجر', 'price': 'السعر (ر.س)'})
+                st.plotly_chart(fig2, use_container_width=True)
+
+        # --- التحليل الذكي ---
+        st.markdown("---")
+        st.subheader("🏆 التحليل الذكي: أين تشتري؟")
+
+        # إيجاد أرخص سعر لكل منتج
+        cheapest_products = filtered_df.loc[filtered_df.groupby('product_name')['price'].idxmin()]
+        
+        # تجميع حسب المتجر
+        store_stats = cheapest_products.groupby('store').agg(
+            عدد_المنتجات=('product_name', 'count'),
+            إجمالي_السعر=('price', 'sum')
+        ).reset_index().sort_values('إجمالي_السعر')
+
+        if not store_stats.empty:
+            best_store = store_stats.iloc[0]
+            
+            col_res1, col_res2 = st.columns(2)
+            
+            with col_res1:
+                st.success(f"**🏆 الخيار الأوفر:** {best_store['store']}")
+                st.metric("عدد المنتجات الأرخص لديهم", f"{best_store['عدد_المنتجات']} منتج")
+                st.metric("إجمالي الفاتورة المتوقع", f"{best_store['إجمالي_السعر']:.2f} ر.س")
+
+            with col_res2:
+                st.write("**💰 تفاصيل التوفير:**")
+                # حساب متوسط الأسعار للمقارنة
+                avg_market_price = filtered_df.groupby('product_name')['price'].mean().sum()
+                savings = avg_market_price - best_store['إجمالي_السعر']
+                savings_percent = (savings / avg_market_price) * 100 if avg_market_price > 0 else 0
+                
+                st.metric("متوسط سعر السوق", f"{avg_market_price:.2f} ر.س")
+                st.metric("إجمالي التوفير", f"{savings:.2f} ر.س", 
+                         delta=f"-{savings_percent:.1f}%", delta_color="normal")
+
+        # --- الإحصائيات العامة ---
+        st.markdown("---")
+        st.subheader("📈 إحصائيات عامة")
+        
+        if not filtered_df.empty:
+            col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+            
+            with col_stat1:
+                total_products = filtered_df['product_name'].nunique()
+                st.metric("عدد المنتجات", total_products)
+            
+            with col_stat2:
+                total_stores = filtered_df['store'].nunique()
+                st.metric("عدد المتاجر", total_stores)
+            
+            with col_stat3:
+                avg_price = filtered_df['price'].mean()
+                st.metric("متوسط الأسعار", f"{avg_price:.2f} ر.س")
+            
+            with col_stat4:
+                total_discounts = (filtered_df['discount_percent'] > 0).sum()
+                st.metric("عروض التخفيض", total_discounts)
+
+        # --- نصائح التوفير ---
+        st.info("""
+        💡 **نصائح ذكية للتوفير:**
+        - ✨ قارن الأسعار بين 3 متاجر على الأقل قبل الشراء
+        - 🎯 تابع عروض نهاية الأسبوع والمناسبات
+        - 📦 فكر في الشراء بكميات كبيرة للمواد الأساسية
+        - 🔔 اشترك في نشرات المتاجر الإلكترونية للحصول على أحدث العروض
+        """)
+
+        # --- التصدير ---
+        st.markdown("---")
+        st.subheader("💾 حفظ النتائج")
+        
+        col_export1, col_export2 = st.columns(2)
+        
+        with col_export1:
+            # تحويل لملف Excel
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                filtered_df.to_excel(writer, index=False, sheet_name='نتائج_مقارنة_الأسعار')
+                workbook = writer.book
+                worksheet = writer.sheets['نتائج_مقارنة_الأسعار']
+                format1 = workbook.add_format({'num_format': '#,##0.00'})
+                worksheet.set_column('C:C', None, format1)
+            
+            excel_data = output.getvalue()
+            
+            st.download_button(
+                label="📥 تحميل النتائج (Excel)",
+                data=excel_data,
+                file_name="نتائج_مقارنة_الأسعار.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        
+        with col_export2:
+            # تصدير كـ CSV
+            csv_data = filtered_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📄 تحميل النتائج (CSV)",
+                data=csv_data,
+                file_name="نتائج_مقارنة_الأسعار.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+    elif start_btn and not products_input:
+        st.warning("⚠️ الرجاء إدخال قائمة المنتجات أولاً.")
+
+# تشغيل التطبيق
+if __name__ == "__main__":
+    main()
