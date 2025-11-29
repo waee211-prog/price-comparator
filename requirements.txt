@@ -1,5 +1,2 @@
-streamlit==1.38.0
-nodriver==0.31
-pandas==2.2.2
-ttl-cache==2.11.0
-asyncio
+pip install -r requirements.txt
+streamlit run app.py
